@@ -120,8 +120,17 @@ async def register_user(
             "user": user_data
         }
     
+    except HTTPException as http_ex:
+        # Re-raise HTTP exceptions (like configuration errors)
+        raise http_ex
     except Exception as e:
         error_message = str(e)
+        # Check if it's a configuration error
+        if "configuration error" in error_message.lower() or "supabase_url" in error_message.lower() or "supabase_key" in error_message.lower():
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Server configuration error: {error_message}. Please check Vercel environment variables."
+            )
         if "already registered" in error_message.lower() or "already exists" in error_message.lower():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -194,8 +203,17 @@ async def login_user(
             "user": user_data
         }
     
+    except HTTPException as http_ex:
+        # Re-raise HTTP exceptions (like configuration errors)
+        raise http_ex
     except Exception as e:
         error_message = str(e)
+        # Check if it's a configuration error
+        if "configuration error" in error_message.lower() or "supabase_url" in error_message.lower() or "supabase_key" in error_message.lower():
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Server configuration error: {error_message}. Please check Vercel environment variables."
+            )
         if "invalid" in error_message.lower() or "wrong" in error_message.lower():
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,

@@ -7,4 +7,4 @@ __pycache__/
 *.pyd
 .Python
 .DS_Store
-.env*
+
