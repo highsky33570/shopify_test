@@ -10,6 +10,12 @@ security = HTTPBearer()
 
 def get_supabase_client() -> Client:
     """Get Supabase client instance"""
+    is_valid, error_msg = settings.validate_supabase_config()
+    if not is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Configuration error: {error_msg}. Please set SUPABASE_URL and SUPABASE_KEY environment variables."
+        )
     return create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
 
 
