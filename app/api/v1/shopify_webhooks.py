@@ -1,10 +1,15 @@
 import hmac
 import hashlib
 import base64
+import json
+import logging
 from typing import Optional
 from fastapi import APIRouter, HTTPException, status, Request, Header
 from supabase import create_client, Client
 from app.config import settings
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -53,35 +58,39 @@ async def shopify_customer_create_webhook(
     """
     Shopify webhook endpoint for customer creation
     When a customer is created in Shopify, automatically register them in Supabase
+    Logs request content and returns success immediately for Vercel
     """
+    # Get raw request body for logging and signature verification
+    body = await request.body()
+    
+    # Log request content for debugging on Vercel
     try:
-        # Get raw request body for signature verification
-        body = await request.body()
-        
-        # Verify webhook signature if secret is configured
-        webhook_secret = getattr(settings, 'SHOPIFY_WEBHOOK_SECRET', None)
-        if webhook_secret and x_shopify_hmac_sha256:
-            if not verify_shopify_webhook(body, x_shopify_hmac_sha256, webhook_secret):
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Invalid webhook signature"
-                )
-        
-        # Parse webhook payload
-        import json
-        try:
-            payload = await request.json()
-        except:
-            payload = json.loads(body.decode('utf-8'))
+        payload = json.loads(body.decode('utf-8'))
+        logger.info(f"Shopify webhook received - Shop: {x_shopify_shop_domain}, Topic: {x_shopify_topic}")
+        logger.info(f"Webhook payload: {json.dumps(payload, indent=2)}")
+        logger.info(f"Headers - Shop Domain: {x_shopify_shop_domain}, Topic: {x_shopify_topic}, HMAC: {x_shopify_hmac_sha256[:20] if x_shopify_hmac_sha256 else None}...")
+    except Exception as e:
+        logger.warning(f"Failed to parse webhook payload: {str(e)}")
+        logger.info(f"Raw body: {body.decode('utf-8', errors='ignore')}")
+        payload = {}
+    
+    # Verify webhook signature if secret is configured
+    webhook_secret = getattr(settings, 'SHOPIFY_WEBHOOK_SECRET', None)
+    if webhook_secret and x_shopify_hmac_sha256:
+        if not verify_shopify_webhook(body, x_shopify_hmac_sha256, webhook_secret):
+            logger.error("Invalid webhook signature")
+            # Still return success to acknowledge webhook, but log the error
+            return {"status": "error", "message": "Invalid signature (logged)"}
+    
+    # Return success immediately (async processing can happen in background)
+    try:
         
         # Extract customer data from Shopify webhook
         customer = payload.get('customer') or payload
         
         if not customer:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No customer data found in webhook payload"
-            )
+            logger.warning("No customer data found in webhook payload")
+            return {"status": "success", "message": "Webhook received (no customer data)"}
         
         # Extract customer information
         email = customer.get('email')
@@ -92,16 +101,16 @@ async def shopify_customer_create_webhook(
         customer_id = customer.get('id')
         
         if not email:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Customer email is required"
-            )
+            logger.warning("Customer email is missing in webhook payload")
+            return {"status": "success", "message": "Webhook received (no email)"}
+        
+        logger.info(f"Processing customer creation: {email} (Shopify ID: {customer_id})")
         
         # Generate a temporary password or use a default one
         # In production, you might want to send a password reset email
         temp_password = f"shopify_{customer_id}_{email}".replace('@', '_').replace('.', '_')
         
-        # Register user in Supabase
+        # Register user in Supabase (async processing)
         supabase = get_supabase_client()
         
         # Try to create new user in Supabase
@@ -123,55 +132,46 @@ async def shopify_customer_create_webhook(
             })
             
             if response.user is None:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to create user in Supabase"
-                )
+                logger.error(f"Failed to create user in Supabase for {email}")
+                return {"status": "success", "message": "Webhook received (user creation failed - logged)"}
             
-            # Build user data response
-            user_data = {
-                "id": response.user.id,
-                "email": response.user.email,
-                "phone": getattr(response.user, 'phone', None),
-                "user_metadata": response.user.user_metadata if hasattr(response.user, 'user_metadata') else {},
-                "created_at": str(response.user.created_at) if response.user.created_at else None,
-            }
+            logger.info(f"Successfully created user in Supabase: {response.user.id} for {email}")
             
+            # Return success immediately
             return {
                 "status": "success",
                 "message": "Customer registered in Supabase",
-                "user": user_data,
-                "shopify_customer_id": str(customer_id),
-                "note": "User created with temporary password. Consider sending password reset email."
+                "user_id": response.user.id,
+                "email": email,
+                "shopify_customer_id": str(customer_id)
             }
         
         except Exception as signup_error:
             error_msg = str(signup_error).lower()
+            logger.error(f"Error creating user: {str(signup_error)}")
+            
             # Check if user already exists
             if "already registered" in error_msg or "already exists" in error_msg or "user already" in error_msg:
-                # User exists, return success message
+                logger.info(f"User already exists: {email}")
                 return {
                     "status": "success",
                     "message": "User already exists in Supabase",
                     "email": email,
-                    "shopify_customer_id": str(customer_id),
-                    "note": "User already registered. Consider updating metadata if needed."
+                    "shopify_customer_id": str(customer_id)
                 }
             else:
-                # Re-raise if it's a different error
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Failed to create user: {str(signup_error)}"
-                )
+                # Log error but still return success to acknowledge webhook
+                logger.error(f"Failed to create user: {str(signup_error)}")
+                return {
+                    "status": "success",
+                    "message": "Webhook received (error logged)",
+                    "email": email
+                }
     
-    except HTTPException:
-        raise
     except Exception as e:
-        error_message = str(e)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Webhook processing failed: {error_message}"
-        )
+        # Log error but return success to acknowledge webhook
+        logger.error(f"Webhook processing error: {str(e)}")
+        return {"status": "success", "message": "Webhook received (error logged)"}
 
 
 @router.post("/customers/update")
@@ -184,42 +184,42 @@ async def shopify_customer_update_webhook(
     """
     Shopify webhook endpoint for customer updates
     Updates user metadata in Supabase when customer is updated in Shopify
+    Logs request content and returns success immediately for Vercel
     """
+    # Get raw request body for logging and signature verification
+    body = await request.body()
+    
+    # Log request content for debugging on Vercel
     try:
-        # Get raw request body for signature verification
-        body = await request.body()
-        
-        # Verify webhook signature if secret is configured
-        webhook_secret = getattr(settings, 'SHOPIFY_WEBHOOK_SECRET', None)
-        if webhook_secret and x_shopify_hmac_sha256:
-            if not verify_shopify_webhook(body, x_shopify_hmac_sha256, webhook_secret):
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Invalid webhook signature"
-                )
-        
-        # Parse webhook payload
-        import json
-        try:
-            payload = await request.json()
-        except:
-            payload = json.loads(body.decode('utf-8'))
-        
+        payload = json.loads(body.decode('utf-8'))
+        logger.info(f"Shopify customer update webhook received - Shop: {x_shopify_shop_domain}, Topic: {x_shopify_topic}")
+        logger.info(f"Webhook payload: {json.dumps(payload, indent=2)}")
+        logger.info(f"Headers - Shop Domain: {x_shopify_shop_domain}, Topic: {x_shopify_topic}, HMAC: {x_shopify_hmac_sha256[:20] if x_shopify_hmac_sha256 else None}...")
+    except Exception as e:
+        logger.warning(f"Failed to parse webhook payload: {str(e)}")
+        logger.info(f"Raw body: {body.decode('utf-8', errors='ignore')}")
+        payload = {}
+    
+    # Verify webhook signature if secret is configured
+    webhook_secret = getattr(settings, 'SHOPIFY_WEBHOOK_SECRET', None)
+    if webhook_secret and x_shopify_hmac_sha256:
+        if not verify_shopify_webhook(body, x_shopify_hmac_sha256, webhook_secret):
+            logger.error("Invalid webhook signature")
+            # Still return success to acknowledge webhook, but log the error
+            return {"status": "success", "message": "Webhook received (invalid signature - logged)"}
+    
+    try:
         # Extract customer data
         customer = payload.get('customer') or payload
         
         if not customer:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No customer data found in webhook payload"
-            )
+            logger.warning("No customer data found in webhook payload")
+            return {"status": "success", "message": "Webhook received (no customer data)"}
         
         email = customer.get('email')
         if not email:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Customer email is required"
-            )
+            logger.warning("Customer email is missing in webhook payload")
+            return {"status": "success", "message": "Webhook received (no email)"}
         
         # Update user metadata
         first_name = customer.get('first_name', '')
@@ -228,32 +228,30 @@ async def shopify_customer_update_webhook(
         phone = customer.get('phone')
         customer_id = customer.get('id')
         
+        logger.info(f"Processing customer update: {email} (Shopify ID: {customer_id})")
+        
         # Try to update using admin client if available
         try:
             admin_client = get_supabase_admin_client()
             # Note: Admin API methods may vary by Supabase client version
-            # For now, return a message that update was received
+            logger.info(f"Customer update received for {email}")
             return {
                 "status": "success",
                 "message": "Customer update received",
                 "email": email,
-                "shopify_customer_id": str(customer_id),
-                "note": "Metadata update requires admin API. User should update profile through app."
+                "shopify_customer_id": str(customer_id)
             }
-        except:
+        except Exception as e:
+            logger.warning(f"Admin client not available: {str(e)}")
             # If admin client not available, just acknowledge the webhook
             return {
                 "status": "success",
                 "message": "Customer update webhook received",
                 "email": email,
-                "shopify_customer_id": str(customer_id),
-                "note": "Admin API not configured. User metadata update skipped."
+                "shopify_customer_id": str(customer_id)
             }
     
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Webhook processing failed: {str(e)}"
-        )
+        # Log error but return success to acknowledge webhook
+        logger.error(f"Webhook processing error: {str(e)}")
+        return {"status": "success", "message": "Webhook received (error logged)"}
