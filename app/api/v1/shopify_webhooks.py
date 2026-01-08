@@ -115,7 +115,8 @@ async def shopify_customer_create_webhook(
         
         # Generate a temporary password or use a default one
         # In production, you might want to send a password reset email
-        temp_password = f"shopify_{customer_id}_{email}".replace('@', '_').replace('.', '_')
+        # temp_password = f"shopify_{customer_id}_{email}".replace('@', '_').replace('.', '_')
+        temp_password = f"Qwer1234!@#$"
         
         # Register user in Supabase (async processing)
         supabase = get_supabase_client()
