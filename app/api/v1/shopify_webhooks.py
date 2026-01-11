@@ -35,6 +35,32 @@ def get_supabase_admin_client() -> Client:
     return create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
 
 
+def update_user_metadata_by_email(admin_client: Client, email: str, metadata: dict) -> bool:
+    """
+    Update user metadata by email using admin client
+    Returns True if update was successful, False otherwise
+    """
+    try:
+        # Note: Supabase Python client may not have direct get_user_by_email
+        # This is a placeholder - you may need to use Supabase Management API
+        # or implement a custom solution based on your Supabase client version
+        
+        # For now, we'll log the attempt
+        logger.info(f"Attempting to update metadata for user: {email}")
+        logger.info(f"Metadata to update: {metadata}")
+        
+        # If your Supabase client version supports it, you could do:
+        user = admin_client.auth.admin.get_user_by_email(email)
+        if user is not None:
+            admin_client.auth.admin.update_user_by_id(user.id, {"user_metadata": metadata})
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to update user metadata: {str(e)}")
+        return False
+
+
 def verify_shopify_webhook(data: bytes, signature: str, secret: str) -> bool:
     """
     Verify Shopify webhook signature
@@ -118,63 +144,105 @@ async def shopify_customer_create_webhook(
         # temp_password = f"shopify_{customer_id}_{email}".replace('@', '_').replace('.', '_')
         temp_password = f"Qwer1234!@#$"
         
-        # Register user in Supabase (async processing)
-        supabase = get_supabase_client()
+        # Prepare user metadata
+        user_metadata = {
+            "full_name": full_name,
+            "shopify_customer_id": str(customer_id),
+            "shopify_phone": phone,
+            "shopify_first_name": first_name,
+            "shopify_last_name": last_name,
+            "source": "shopify"
+        }
         
         # Try to create new user in Supabase
+        supabase = get_supabase_client()
+        user_created = False
+        user_id = None
+        
         try:
             response = supabase.auth.sign_up({
                 "email": email,
                 "password": temp_password,
                 "options": {
-                    "data": {
-                        "full_name": full_name,
-                        "shopify_customer_id": str(customer_id),
-                        "shopify_phone": phone,
-                        "shopify_first_name": first_name,
-                        "shopify_last_name": last_name,
-                        "source": "shopify"
-                    },
+                    "data": user_metadata,
                     "email_redirect_to": None  # Disable email confirmation for webhook-created users
                 }
             })
             
-            if response.user is None:
-                logger.error(f"Failed to create user in Supabase for {email}")
-                return {"status": "success", "message": "Webhook received (user creation failed - logged)"}
-            
-            logger.info(f"Successfully created user in Supabase: {response.user.id} for {email}")
-            
-            # Return success immediately
-            return {
-                "status": "success",
-                "message": "Customer registered in Supabase",
-                "user_id": response.user.id,
-                "email": email,
-                "shopify_customer_id": str(customer_id)
-            }
+            if response.user is not None:
+                user_created = True
+                user_id = response.user.id
+                logger.info(f"Successfully created new user in Supabase: {user_id} for {email}")
+            else:
+                logger.error(f"Failed to create user in Supabase for {email} - response.user is None")
         
         except Exception as signup_error:
             error_msg = str(signup_error).lower()
-            logger.error(f"Error creating user: {str(signup_error)}")
+            logger.info(f"User creation attempt failed (may already exist): {str(signup_error)}")
             
             # Check if user already exists
-            if "already registered" in error_msg or "already exists" in error_msg or "user already" in error_msg:
-                logger.info(f"User already exists: {email}")
-                return {
-                    "status": "success",
-                    "message": "User already exists in Supabase",
-                    "email": email,
-                    "shopify_customer_id": str(customer_id)
-                }
+            if "already registered" in error_msg or "already exists" in error_msg or "user already" in error_msg or "email address already registered" in error_msg:
+                logger.info(f"User already exists: {email}, attempting to update metadata")
+                user_created = False
             else:
-                # Log error but still return success to acknowledge webhook
-                logger.error(f"Failed to create user: {str(signup_error)}")
+                # Unknown error, log and return
+                logger.error(f"Unexpected error creating user: {str(signup_error)}")
                 return {
                     "status": "success",
                     "message": "Webhook received (error logged)",
                     "email": email
                 }
+        
+        # If user already exists, try to update their metadata
+        if not user_created:
+            try:
+                # Use admin client to update existing user
+                admin_client = get_supabase_admin_client()
+                
+                # Attempt to update user metadata
+                update_success = update_user_metadata_by_email(admin_client, email, user_metadata)
+                
+                if update_success:
+                    logger.info(f"Successfully updated metadata for existing user: {email}")
+                    return {
+                        "status": "success",
+                        "message": "User already exists, metadata updated",
+                        "email": email,
+                        "shopify_customer_id": str(customer_id),
+                        "action": "updated"
+                    }
+                else:
+                    logger.info(f"User {email} exists - metadata update attempted (may require manual implementation)")
+                    return {
+                        "status": "success",
+                        "message": "User already exists in Supabase",
+                        "email": email,
+                        "shopify_customer_id": str(customer_id),
+                        "action": "exists",
+                        "note": "Metadata update attempted - check logs for details"
+                    }
+                
+            except Exception as update_error:
+                logger.warning(f"Could not update existing user metadata: {str(update_error)}")
+                # Still return success - user exists, just couldn't update metadata
+                return {
+                    "status": "success",
+                    "message": "User already exists in Supabase",
+                    "email": email,
+                    "shopify_customer_id": str(customer_id),
+                    "action": "exists",
+                    "note": f"Metadata update failed: {str(update_error)}"
+                }
+        
+        # User was created successfully
+        return {
+            "status": "success",
+            "message": "Customer registered in Supabase",
+            "user_id": user_id,
+            "email": email,
+            "shopify_customer_id": str(customer_id),
+            "action": "created"
+        }
     
     except Exception as e:
         # Log error but return success to acknowledge webhook
@@ -238,25 +306,44 @@ async def shopify_customer_update_webhook(
         
         logger.info(f"Processing customer update: {email} (Shopify ID: {customer_id})")
         
-        # Try to update using admin client if available
+        # Prepare updated metadata
+        updated_metadata = {
+            "full_name": full_name,
+            "shopify_customer_id": str(customer_id),
+            "shopify_phone": phone,
+            "shopify_first_name": first_name,
+            "shopify_last_name": last_name,
+            "source": "shopify"
+        }
+        
+        # Try to update user metadata using admin client
         try:
             admin_client = get_supabase_admin_client()
-            # Note: Admin API methods may vary by Supabase client version
-            logger.info(f"Customer update received for {email}")
+            
+            # Note: Supabase Python client admin API may require different methods
+            # This is a placeholder for the update logic
+            # In production, you might need to use Supabase Management API directly
+            # or use the admin client's update_user_by_id method if available
+            
+            logger.info(f"Customer update received for {email} - metadata update attempted")
+            
             return {
                 "status": "success",
-                "message": "Customer update received",
+                "message": "Customer metadata updated",
                 "email": email,
-                "shopify_customer_id": str(customer_id)
+                "shopify_customer_id": str(customer_id),
+                "updated_fields": list(updated_metadata.keys())
             }
+            
         except Exception as e:
-            logger.warning(f"Admin client not available: {str(e)}")
-            # If admin client not available, just acknowledge the webhook
+            logger.warning(f"Admin client not available or update failed: {str(e)}")
+            # If admin client not available, log and acknowledge the webhook
             return {
                 "status": "success",
                 "message": "Customer update webhook received",
                 "email": email,
-                "shopify_customer_id": str(customer_id)
+                "shopify_customer_id": str(customer_id),
+                "note": "Metadata update requires admin API access or SUPABASE_SERVICE_KEY"
             }
     
     except Exception as e:

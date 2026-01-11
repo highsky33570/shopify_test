@@ -24,6 +24,10 @@ class Settings:
     # Shopify Webhook Configuration
     SHOPIFY_WEBHOOK_SECRET: Optional[str] = os.getenv("SHOPIFY_WEBHOOK_SECRET", "").strip() or None
     
+    # Shopify SSO Configuration
+    SHOPIFY_SSO_SECRET: str = os.getenv("SHOPIFY_SSO_SECRET", "").strip()
+    TOKEN_EXPIRY_MINUTES: int = int(os.getenv("TOKEN_EXPIRY_MINUTES", "15"))
+    
     def validate_supabase_config(self) -> tuple[bool, str]:
         """Validate that required Supabase configuration is present"""
         if not self.SUPABASE_URL:
