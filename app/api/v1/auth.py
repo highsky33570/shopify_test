@@ -6,7 +6,7 @@ import logging
 import secrets
 from typing import Optional, Dict
 from datetime import datetime
-from fastapi import APIRouter, HTTPException, Query, Request, status, Depends, Form, RedirectResponse
+from fastapi import APIRouter, HTTPException, Query, Request, status, Depends, Form
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
